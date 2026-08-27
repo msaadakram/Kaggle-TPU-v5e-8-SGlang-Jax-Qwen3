@@ -1,0 +1,313 @@
+# Kaggle TPU v5e-8: SGLang-JAX + Qwen3-8B
+
+Save this. Run cells in order. Do not rerun install after it succeeds.
+
+## 0. Notebook settings
+
+1. Open a Kaggle notebook.
+2. Settings → Accelerator → **TPU v5e-8**.
+3. Settings → Internet → **On**.
+4. Phone-verify the Kaggle account if TPU is locked.
+
+Limits:
+- Context: `40960` tokens
+- Safe chat `max_tokens`: `4096`
+- GLM-5.3-Flash does **not** fit on v5e-8
+
+---
+
+## 1. One-time install
+
+Paste as **one** cell. `%%bash` must be the first line.
+
+```bash
+%%bash
+pip install -q uv
+cd /kaggle/working
+uv venv --python 3.12 /kaggle/working/sglang-env
+git clone https://github.com/sgl-project/sglang-jax.git
+source /kaggle/working/sglang-env/bin/activate
+cd /kaggle/working/sglang-jax
+uv pip install -e "./python[all]"
+```
+
+Ignore:
+- pip running as root
+- uv hardlink / copy warning
+- transparent hugepages warning later
+
+If you rerun this cell and see `virtual environment already exists` / `destination path already exists`, that is OK. Skip to step 2.
+
+Clean reinstall only if needed:
+
+```bash
+%%bash
+rm -rf /kaggle/working/sglang-env
+uv venv --python 3.12 /kaggle/working/sglang-env
+source /kaggle/working/sglang-env/bin/activate
+cd /kaggle/working/sglang-jax
+uv pip install -e "./python[all]"
+```
+
+---
+
+## 2. Verify TPU
+
+```bash
+%%bash
+source /kaggle/working/sglang-env/bin/activate
+python -c "import jax; print(jax.devices()); print(len(jax.devices()))"
+```
+
+You want **8** TPU devices. If you see CPU only, the notebook is not attached to TPU v5e-8.
+
+---
+
+## 3. Start server
+
+Do **not** rerun clone/venv. This downloads `Qwen/Qwen3-8B` from Hugging Face into `/kaggle/working/models` on first run.
+
+```python
+import os, subprocess, pathlib
+
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/kaggle/working/jit_cache"
+pathlib.Path("/kaggle/working/models").mkdir(parents=True, exist_ok=True)
+pathlib.Path("/kaggle/working/logs").mkdir(parents=True, exist_ok=True)
+
+cmd = [
+    "/kaggle/working/sglang-env/bin/python", "-u", "-m", "sgl_jax.launch_server",
+    "--model-path", "Qwen/Qwen3-8B",
+    "--trust-remote-code",
+    "--tp-size", "8",
+    "--device", "tpu",
+    "--mem-fraction-static", "0.8",
+    "--chunked-prefill-size", "2048",
+    "--download-dir", "/kaggle/working/models",
+    "--dtype", "bfloat16",
+    "--max-running-requests", "32",
+    "--page-size", "128",
+    "--host", "0.0.0.0",
+    "--port", "30000",
+]
+
+log = open("/kaggle/working/logs/sglang.log", "w")
+proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+print("pid", proc.pid)
+```
+
+First start compiles JAX graphs (`EXTEND` then `DECODE` precompile). Wait. Do not start a second server.
+
+Use a local path after the first download if this folder exists:
+
+```text
+/kaggle/working/models/Qwen/Qwen3-8B
+```
+
+---
+
+## 4. Wait until ready
+
+```python
+import requests, time
+from pathlib import Path
+
+for i in range(90):
+    try:
+        r = requests.get("http://127.0.0.1:30000/v1/models", timeout=2)
+        if r.ok:
+            print("ready", r.json())
+            break
+    except Exception:
+        if i % 10 == 0:
+            print("waiting", i)
+            p = Path("/kaggle/working/logs/sglang.log")
+            if p.exists():
+                print(p.read_text()[-800:])
+        time.sleep(10)
+else:
+    raise RuntimeError("server did not start; check /kaggle/working/logs/sglang.log")
+```
+
+Ready looks like:
+
+```text
+ready {'object': 'list', 'data': [{'id': 'Qwen/Qwen3-8B', ... 'max_model_len': 40960}]}
+```
+
+Check log only:
+
+```python
+print(open("/kaggle/working/logs/sglang.log").read()[-4000:])
+```
+
+---
+
+## 5. One-shot test
+
+```python
+import requests
+
+resp = requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen3-8B",
+        "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+        "max_tokens": 256,
+        "temperature": 0.7,
+        "chat_template_kwargs": {"enable_thinking": False},
+    },
+    timeout=180,
+)
+print(resp.status_code)
+print(resp.json()["choices"][0]["message"]["content"])
+```
+
+---
+
+## 6. Live chat
+
+Run while the server is up. Type in the prompt, Enter. Type `exit` to quit.
+
+```python
+import json
+import requests
+
+URL = "http://127.0.0.1:30000/v1/chat/completions"
+MODEL = "Qwen/Qwen3-8B"
+MAX_TOKENS = 4096
+MAX_TURNS = 20
+messages = []
+
+print("Qwen3-8B on TPU. Type exit to quit.\n")
+
+while True:
+    user = input("You: ").strip()
+    if not user:
+        continue
+    if user.lower() in {"exit", "quit"}:
+        print("bye")
+        break
+
+    messages.append({"role": "user", "content": user})
+    if len(messages) > MAX_TURNS * 2:
+        messages = messages[-(MAX_TURNS * 2):]
+
+    print("Bot: ", end="", flush=True)
+
+    r = requests.post(
+        URL,
+        json={
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0.7,
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        stream=True,
+        timeout=600,
+    )
+    r.raise_for_status()
+
+    assistant = ""
+    for raw in r.iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8")
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        chunk = json.loads(data)
+        delta = chunk["choices"][0].get("delta", {}).get("content") or ""
+        assistant += delta
+        print(delta, end="", flush=True)
+
+    print("\n")
+    messages.append({"role": "assistant", "content": assistant})
+```
+
+If `input()` does not work, edit `USER_MSG` and rerun:
+
+```python
+import requests
+
+USER_MSG = "hello, who are you?"
+
+if "messages" not in globals():
+    messages = []
+
+messages.append({"role": "user", "content": USER_MSG})
+
+resp = requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen3-8B",
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "chat_template_kwargs": {"enable_thinking": False},
+    },
+    timeout=600,
+)
+text = resp.json()["choices"][0]["message"]["content"]
+messages.append({"role": "assistant", "content": text})
+print(text)
+```
+
+---
+
+## 7. Connection refused
+
+`Connection refused` on `127.0.0.1:30000` means the server process is dead (kernel restart, session restart, TPU disconnect). Chat cannot start it.
+
+Check:
+
+```python
+import socket, pathlib
+
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", 30000))
+    print("server is up")
+except Exception as e:
+    print("server is down:", e)
+finally:
+    s.close()
+
+log = pathlib.Path("/kaggle/working/logs/sglang.log")
+print("log exists:", log.exists())
+if log.exists():
+    print(log.read_text()[-2500:])
+```
+
+If down: attach TPU v5e-8 again, rerun **step 3**, wait with **step 4**, then chat.
+
+---
+
+## 8. Token limits
+
+| Item | Value |
+|---|---|
+| `max_model_len` | 40960 |
+| Safe `max_tokens` | 4096 |
+| Hard cap per reply | `40960 - prompt_tokens` |
+| Do not use | `300000` |
+
+Long C++ / long files: keep `max_tokens=4096` and continue in a loop. One call will not emit 3000 lines.
+
+---
+
+## Paths
+
+| Thing | Path |
+|---|---|
+| Venv | `/kaggle/working/sglang-env` |
+| Source | `/kaggle/working/sglang-jax` |
+| Weights | `/kaggle/working/models` |
+| JAX cache | `/kaggle/working/jit_cache` |
+| Server log | `/kaggle/working/logs/sglang.log` |
+| API | `http://127.0.0.1:30000` |
+| Model | Hugging Face `Qwen/Qwen3-8B` |
